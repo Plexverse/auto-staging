@@ -4,6 +4,8 @@
 
 A powerful GitHub Action for automatically managing staging branches with configurable sync, reset, and PR labeling functionality.
 
+![Example](https://i.ibb.co/Kj71LTMY/discordbanner.gif)
+
 ## Features
 
 - ✅ **Auto-sync staging branch** - Automatically syncs commits from main branch to staging branch
