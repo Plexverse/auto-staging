@@ -73,11 +73,33 @@ sync_to_staging() {
     git reset --hard "origin/$staging_branch" --quiet
     
     # Merge main into staging
-    git merge "origin/$main_branch" --no-edit --quiet || {
-        log_warn "Merge conflict detected. Attempting to resolve..."
+    local merge_output=$(git merge "origin/$main_branch" --no-edit 2>&1)
+    if [ $? -ne 0 ]; then
+        log_warn "Merge conflict detected when syncing $main_branch to $staging_branch"
         git merge --abort 2>/dev/null || true
+        
+        # Find PRs that might be affected (PRs with staged label)
+        if [ "$ENABLE_PR_LABELING" = "true" ]; then
+            local affected_prs=$(get_prs_with_staged_label)
+            if [ -n "$affected_prs" ]; then
+                local comment="⚠️ **Auto-sync from \`$main_branch\` to \`$staging_branch\` failed**\n\n"
+                comment+="A merge conflict occurred while syncing commits from \`$main_branch\` to \`$staging_branch\`. "
+                comment+="This may affect staged PRs. The staging branch will need to be manually updated or reset.\n\n"
+                comment+="You may need to:\n"
+                comment+="1. Manually resolve conflicts in \`$staging_branch\`\n"
+                comment+="2. Or reset \`$staging_branch\` to \`$main_branch\` (this will remove all staged changes)"
+                
+                while IFS= read -r pr_number; do
+                    if [ -n "$pr_number" ]; then
+                        post_pr_comment "$pr_number" "$comment"
+                        log_info "Posted sync failure comment to PR #$pr_number"
+                    fi
+                done <<< "$affected_prs"
+            fi
+        fi
+        
         return 1
-    }
+    fi
     
     # Push changes
     git push origin "$staging_branch" --quiet
@@ -175,6 +197,20 @@ remove_label() {
         "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels/$label" > /dev/null
 }
 
+# Post comment to PR
+post_pr_comment() {
+    local pr_number="$1"
+    local comment="$2"
+    
+    local comment_json=$(jq -n --arg body "$comment" '{body: $body}')
+    
+    curl -s -X POST \
+        -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$pr_number/comments" \
+        -d "$comment_json" > /dev/null
+}
+
 # Get PR commits
 get_pr_commits() {
     local pr_number="$1"
@@ -259,7 +295,10 @@ handle_pr_labeled() {
     fi
     
     # Merge PR into staging
-    if git merge "$pr_sha" --no-edit --quiet; then
+    local merge_output=$(git merge "$pr_sha" --no-edit 2>&1)
+    local merge_status=$?
+    
+    if [ $merge_status -eq 0 ]; then
         git push origin "$STAGING_BRANCH" --quiet
         log_info "Successfully merged PR #$pr_number into $STAGING_BRANCH"
         
@@ -269,6 +308,24 @@ handle_pr_labeled() {
     else
         log_error "Failed to merge PR #$pr_number into $STAGING_BRANCH"
         git merge --abort 2>/dev/null || true
+        
+        # Post comment to PR about the failure
+        local comment="❌ **Failed to stage this PR**\n\n"
+        comment+="The merge into \`$STAGING_BRANCH\` failed. "
+        
+        if echo "$merge_output" | grep -qi "CONFLICT\|conflict"; then
+            comment+="**Merge conflict detected.**\n\n"
+            comment+="Please resolve the conflicts and try again. You may need to:\n"
+            comment+="1. Update your branch with the latest changes from \`$STAGING_BRANCH\`\n"
+            comment+="2. Resolve any conflicts\n"
+            comment+="3. Remove and re-add the \`$TO_STAGE_LABEL\` label to retry staging"
+        else
+            comment+="**Merge error occurred.**\n\n"
+            comment+="Please check your PR and try again. You can remove and re-add the \`$TO_STAGE_LABEL\` label to retry staging."
+        fi
+        
+        post_pr_comment "$pr_number" "$comment"
+        log_info "Posted failure comment to PR #$pr_number"
         return 1
     fi
 }
