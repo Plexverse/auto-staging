@@ -248,10 +248,17 @@ all_pr_commits_in_staging() {
 handle_pr_labeled() {
     local pr_number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
+    local base_branch=$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")
     
     if [ "$pr_number" = "null" ] || [ -z "$pr_number" ]; then
         log_error "Could not determine PR number from event"
         return 1
+    fi
+    
+    # Only process PRs targeting the main branch
+    if [ "$base_branch" != "$MAIN_BRANCH" ]; then
+        log_info "PR #$pr_number targets branch '$base_branch', not '$MAIN_BRANCH'. Skipping."
+        return 0
     fi
     
     if [ "$label" != "$TO_STAGE_LABEL" ]; then
@@ -442,18 +449,30 @@ main() {
             ;;
         "pull_request")
             local action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
+            log_info "Pull request event detected with action: $action"
+            log_info "Event payload preview:"
+            jq '{action, pull_request: {number: .pull_request.number, head: .pull_request.head.ref}, label: .label.name}' "$GITHUB_EVENT_PATH" || true
+            
             if [ "$ENABLE_PR_LABELING" = "true" ]; then
                 case "$action" in
                     "opened"|"reopened"|"synchronize")
+                        log_info "Handling PR $action event"
                         handle_pr_reopened
                         ;;
                     "labeled")
+                        log_info "Handling PR labeled event"
                         handle_pr_labeled
                         ;;
                     "unlabeled")
+                        log_info "Handling PR unlabeled event"
                         handle_pr_unlabeled
                         ;;
+                    *)
+                        log_warn "Unhandled pull_request action: $action"
+                        ;;
                 esac
+            else
+                log_info "PR labeling is disabled"
             fi
             ;;
         "push")
