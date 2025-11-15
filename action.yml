@@ -1,4 +1,4 @@
-name: 'Auto Staging'
+name: 'Staging Branch Manager'
 description: 'Automatically manage staging branches with configurable sync, reset, and PR labeling'
 branding:
   icon: 'git-branch'
