@@ -29,12 +29,9 @@ on:
     branches:
       - main
       - staging
-  # Trigger on PR events
+  # Trigger on PR events (including label events)
   pull_request:
-    types: [opened, reopened, synchronize]
-  # Trigger on label events (for to-stage label)
-  issues:
-    types: [labeled, unlabeled]
+    types: [opened, reopened, synchronize, labeled, unlabeled]
   # Allow manual triggering
   workflow_dispatch:
 
@@ -102,7 +99,7 @@ On the configured schedule (default: Sunday midnight UTC), the action:
 When a PR is labeled with the `to-stage` label:
 1. The action merges the PR into the `staging` branch
 2. Adds the `staged` label to the PR
-3. If the merge fails, the action logs an error and doesn't add the label
+3. If the merge fails (e.g., due to conflicts), the action posts a comment on the PR explaining the issue and doesn't add the `staged` label
 
 When a PR is reopened or synchronized:
 1. The action checks if the PR has the `staged` label
@@ -176,7 +173,7 @@ The action requires the following permissions:
 
 - `contents: write` - To push changes to the staging branch
 - `pull-requests: write` - To add/remove labels on PRs
-- `issues: write` - To handle label events on issues/PRs
+- `issues: write` - To post comments on PRs (PRs are treated as issues in the GitHub API)
 
 ## Requirements
 
@@ -196,6 +193,7 @@ If a merge conflict occurs when syncing or staging a PR, the action will:
 - Log a warning
 - Abort the merge
 - Not push any changes
+- Post a comment on affected PRs explaining the conflict and how to resolve it
 - For PR staging, not add the `staged` label
 
 ### PR labels not updating

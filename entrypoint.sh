@@ -246,14 +246,8 @@ all_pr_commits_in_staging() {
 
 # Handle PR labeled event
 handle_pr_labeled() {
-    local pr_number=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
-    
-    # Check if this is actually a PR (not just an issue)
-    local is_pr=$(jq -r '.issue.pull_request' "$GITHUB_EVENT_PATH")
-    if [ "$is_pr" = "null" ] || [ -z "$is_pr" ]; then
-        return 0
-    fi
     
     if [ "$label" != "$TO_STAGE_LABEL" ]; then
         return 0
@@ -332,14 +326,8 @@ handle_pr_labeled() {
 
 # Handle PR unlabeled event
 handle_pr_unlabeled() {
-    local pr_number=$(jq -r '.issue.number' "$GITHUB_EVENT_PATH")
+    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
-    
-    # Check if this is actually a PR (not just an issue)
-    local is_pr=$(jq -r '.issue.pull_request' "$GITHUB_EVENT_PATH")
-    if [ "$is_pr" = "null" ] || [ -z "$is_pr" ]; then
-        return 0
-    fi
     
     if [ "$label" = "$STAGED_LABEL" ]; then
         log_info "PR #$pr_number had $STAGED_LABEL label removed"
@@ -453,17 +441,13 @@ main() {
                     "opened"|"reopened"|"synchronize")
                         handle_pr_reopened
                         ;;
+                    "labeled")
+                        handle_pr_labeled
+                        ;;
+                    "unlabeled")
+                        handle_pr_unlabeled
+                        ;;
                 esac
-            fi
-            ;;
-        "issues")
-            local action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
-            if [ "$ENABLE_PR_LABELING" = "true" ]; then
-                if [ "$action" = "labeled" ]; then
-                    handle_pr_labeled
-                elif [ "$action" = "unlabeled" ]; then
-                    handle_pr_unlabeled
-                fi
             fi
             ;;
         "push")
