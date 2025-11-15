@@ -246,14 +246,21 @@ all_pr_commits_in_staging() {
 
 # Handle PR labeled event
 handle_pr_labeled() {
-    local pr_number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
+    # Handle both pull_request and issues events
+    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
-    local base_branch=$(jq -r '.pull_request.base.ref' "$GITHUB_EVENT_PATH")
     
     if [ "$pr_number" = "null" ] || [ -z "$pr_number" ]; then
         log_error "Could not determine PR number from event"
         return 1
     fi
+    
+    # Get PR details to check base branch
+    local pr_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+        -H "Accept: application/vnd.github.v3+json" \
+        "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
+    
+    local base_branch=$(echo "$pr_response" | jq -r '.base.ref')
     
     # Only process PRs targeting the main branch
     if [ "$base_branch" != "$MAIN_BRANCH" ]; then
@@ -339,7 +346,8 @@ handle_pr_labeled() {
 
 # Handle PR unlabeled event
 handle_pr_unlabeled() {
-    local pr_number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
+    # Handle both pull_request and issues events
+    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
     
     if [ "$label" = "$STAGED_LABEL" ]; then
@@ -449,30 +457,34 @@ main() {
             ;;
         "pull_request")
             local action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
-            log_info "Pull request event detected with action: $action"
-            log_info "Event payload preview:"
-            jq '{action, pull_request: {number: .pull_request.number, head: .pull_request.head.ref}, label: .label.name}' "$GITHUB_EVENT_PATH" || true
-            
             if [ "$ENABLE_PR_LABELING" = "true" ]; then
                 case "$action" in
                     "opened"|"reopened"|"synchronize")
-                        log_info "Handling PR $action event"
                         handle_pr_reopened
                         ;;
-                    "labeled")
-                        log_info "Handling PR labeled event"
-                        handle_pr_labeled
-                        ;;
-                    "unlabeled")
-                        log_info "Handling PR unlabeled event"
-                        handle_pr_unlabeled
-                        ;;
-                    *)
-                        log_warn "Unhandled pull_request action: $action"
-                        ;;
                 esac
-            else
-                log_info "PR labeling is disabled"
+            fi
+            ;;
+        "issues")
+            local action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
+            log_info "Issues event detected with action: $action"
+            log_info "Event payload preview:"
+            jq '{action, issue: {number: .issue.number, pull_request: .issue.pull_request}, label: .label.name}' "$GITHUB_EVENT_PATH" || true
+            
+            if [ "$ENABLE_PR_LABELING" = "true" ]; then
+                # Check if this is actually a PR (not just an issue)
+                local is_pr=$(jq -r '.issue.pull_request' "$GITHUB_EVENT_PATH")
+                if [ "$is_pr" != "null" ] && [ -n "$is_pr" ]; then
+                    if [ "$action" = "labeled" ]; then
+                        log_info "Handling PR labeled event via issues webhook"
+                        handle_pr_labeled
+                    elif [ "$action" = "unlabeled" ]; then
+                        log_info "Handling PR unlabeled event via issues webhook"
+                        handle_pr_unlabeled
+                    fi
+                else
+                    log_info "Event is for an issue, not a PR, skipping"
+                fi
             fi
             ;;
         "push")
