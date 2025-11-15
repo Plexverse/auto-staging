@@ -1,0 +1,81 @@
+name: 'Auto Staging'
+description: 'Automatically manage staging branches with configurable sync, reset, and PR labeling'
+branding:
+  icon: 'git-branch'
+  color: 'blue'
+
+inputs:
+  main_branch:
+    description: 'Name of the main branch (default: main)'
+    required: false
+    default: 'main'
+  
+  staging_branch:
+    description: 'Name of the staging branch (default: staging)'
+    required: false
+    default: 'staging'
+  
+  to_stage_label:
+    description: 'Label to trigger staging a PR (default: to-stage)'
+    required: false
+    default: 'to-stage'
+  
+  staged_label:
+    description: 'Label to mark a PR as staged (default: staged)'
+    required: false
+    default: 'staged'
+  
+  github_token:
+    description: 'GitHub token for API calls and git operations'
+    required: true
+  
+  reset_schedule:
+    description: 'Cron schedule for resetting staging branch (default: 0 0 * * 0 for Sunday midnight)'
+    required: false
+    default: '0 0 * * 0'
+  
+  enable_auto_sync:
+    description: 'Enable auto-sync of main branch commits to staging (default: true)'
+    required: false
+    default: 'true'
+  
+  enable_scheduled_reset:
+    description: 'Enable scheduled reset of staging branch (default: true)'
+    required: false
+    default: 'true'
+  
+  enable_pr_labeling:
+    description: 'Enable PR labeling functionality (default: true)'
+    required: false
+    default: 'true'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Setup Git
+      shell: bash
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+        git config --global init.defaultBranch main
+    
+    - name: Run Auto Staging
+      shell: bash
+      env:
+        MAIN_BRANCH: ${{ inputs.main_branch }}
+        STAGING_BRANCH: ${{ inputs.staging_branch }}
+        TO_STAGE_LABEL: ${{ inputs.to_stage_label }}
+        STAGED_LABEL: ${{ inputs.staged_label }}
+        GITHUB_TOKEN: ${{ inputs.github_token }}
+        ENABLE_AUTO_SYNC: ${{ inputs.enable_auto_sync }}
+        ENABLE_SCHEDULED_RESET: ${{ inputs.enable_scheduled_reset }}
+        ENABLE_PR_LABELING: ${{ inputs.enable_pr_labeling }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_EVENT_NAME: ${{ github.event_name }}
+        GITHUB_EVENT_PATH: ${{ github.event_path }}
+        GITHUB_SHA: ${{ github.sha }}
+        GITHUB_REF: ${{ github.ref }}
+      run: |
+        chmod +x ${{ github.action_path }}/entrypoint.sh
+        ${{ github.action_path }}/entrypoint.sh
+
