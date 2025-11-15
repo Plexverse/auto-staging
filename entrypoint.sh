@@ -248,19 +248,20 @@ all_pr_commits_in_staging() {
 handle_pr_labeled() {
     # Handle both pull_request and issues events
     local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
-    local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
+    local label_added=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
     
     if [ "$pr_number" = "null" ] || [ -z "$pr_number" ]; then
         log_error "Could not determine PR number from event"
         return 1
     fi
     
-    # Get PR details to check base branch
+    # Get current PR details from API (labels may have changed since PR was opened)
     local pr_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
         "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
     
     local base_branch=$(echo "$pr_response" | jq -r '.base.ref')
+    local pr_state=$(echo "$pr_response" | jq -r '.state')
     
     # Only process PRs targeting the main branch
     if [ "$base_branch" != "$MAIN_BRANCH" ]; then
@@ -268,26 +269,35 @@ handle_pr_labeled() {
         return 0
     fi
     
-    if [ "$label" != "$TO_STAGE_LABEL" ]; then
-        log_info "Label '$label' is not '$TO_STAGE_LABEL', skipping"
+    if [ "$pr_state" != "open" ]; then
+        log_warn "PR #$pr_number is not open (state: $pr_state), skipping staging"
         return 0
     fi
     
-    log_info "PR #$pr_number labeled with $TO_STAGE_LABEL, staging PR..."
+    # Check if the PR currently has the to-stage label (get current labels from API)
+    local current_labels=$(echo "$pr_response" | jq -r '.labels[].name' | tr '\n' ' ')
+    local has_to_stage_label=false
     
-    # Get PR details via API
-    local pr_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
-        -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
+    if echo "$current_labels" | grep -q "\b$TO_STAGE_LABEL\b"; then
+        has_to_stage_label=true
+    fi
     
+    # Only process if the label that was just added is to-stage, or if PR currently has to-stage label
+    if [ "$label_added" != "$TO_STAGE_LABEL" ] && [ "$has_to_stage_label" != "true" ]; then
+        log_info "Label added '$label_added' is not '$TO_STAGE_LABEL' and PR doesn't have '$TO_STAGE_LABEL', skipping"
+        return 0
+    fi
+    
+    if [ "$has_to_stage_label" != "true" ]; then
+        log_info "PR #$pr_number doesn't currently have '$TO_STAGE_LABEL' label, skipping"
+        return 0
+    fi
+    
+    log_info "PR #$pr_number has $TO_STAGE_LABEL label, staging PR..."
+    
+    # Use the PR response we already fetched
     local pr_head=$(echo "$pr_response" | jq -r '.head.ref')
     local pr_sha=$(echo "$pr_response" | jq -r '.head.sha')
-    local pr_state=$(echo "$pr_response" | jq -r '.state')
-    
-    if [ "$pr_state" != "open" ]; then
-        log_warn "PR #$pr_number is not open, skipping staging"
-        return 0
-    fi
     
     if [ -z "$pr_head" ] || [ "$pr_head" = "null" ]; then
         log_error "Could not determine PR head branch"
@@ -380,12 +390,14 @@ handle_pr_reopened() {
 
 # Update PR labels after sync
 update_pr_labels_after_sync() {
+    # Get all PRs and check their current labels from API
     local response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
         "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")
     
     echo "$response" | jq -r ".[] | select(.labels[]?.name == \"$STAGED_LABEL\") | .number" | while read -r pr_number; do
         if [ -n "$pr_number" ]; then
+            # Check if all commits are still in staging (using current PR state from API)
             if ! all_pr_commits_in_staging "$pr_number"; then
                 log_info "PR #$pr_number commits are no longer in staging, removing $STAGED_LABEL label..."
                 remove_label "$pr_number" "$STAGED_LABEL"
