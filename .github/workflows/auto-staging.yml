@@ -1,4 +1,4 @@
-name: Auto Staging
+name: Auto Staging 🔁 Auto Staging
 
 on:
   # Scheduled reset every Sunday at midnight
@@ -45,4 +45,3 @@ jobs:
           enable_auto_sync: 'true'
           enable_scheduled_reset: 'true'
           enable_pr_labeling: 'true'
-
