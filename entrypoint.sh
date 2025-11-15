@@ -328,23 +328,25 @@ update_pr_labels_after_sync() {
     done
 }
 
-# Handle push event (check if latest commit is manually staged)
+# Handle push event (sync main to staging, or check if manual staging needs sync)
 handle_push() {
     local ref="$GITHUB_REF"
     local branch="${ref#refs/heads/}"
     
-    if [ "$branch" != "$STAGING_BRANCH" ]; then
-        return 0
-    fi
-    
-    log_info "Push detected to $STAGING_BRANCH, checking if sync is needed..."
-    
-    # Check if there are commits in main that aren't in staging
-    local commits_to_sync=$(get_commits_to_sync "$MAIN_BRANCH" "$STAGING_BRANCH")
-    
-    if [ -n "$commits_to_sync" ]; then
-        log_info "Found commits in $MAIN_BRANCH that aren't in $STAGING_BRANCH, syncing..."
+    if [ "$branch" = "$MAIN_BRANCH" ]; then
+        # Push to main - always sync to staging
+        log_info "Push detected to $MAIN_BRANCH, syncing to $STAGING_BRANCH..."
         sync_to_staging
+    elif [ "$branch" = "$STAGING_BRANCH" ]; then
+        # Push to staging - check if there are commits in main that aren't in staging
+        log_info "Push detected to $STAGING_BRANCH, checking if sync is needed..."
+        
+        local commits_to_sync=$(get_commits_to_sync "$MAIN_BRANCH" "$STAGING_BRANCH")
+        
+        if [ -n "$commits_to_sync" ]; then
+            log_info "Found commits in $MAIN_BRANCH that aren't in $STAGING_BRANCH, syncing..."
+            sync_to_staging
+        fi
     fi
 }
 
