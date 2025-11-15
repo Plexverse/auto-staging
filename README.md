@@ -99,14 +99,19 @@ On the configured schedule (default: Sunday midnight UTC), the action:
 ### PR Labeling
 
 When a PR is labeled with the `to-stage` label:
-1. The action merges the PR into the `staging` branch
-2. Adds the `staged` label to the PR
-3. If the merge fails (e.g., due to conflicts), the action posts a comment on the PR explaining the issue and doesn't add the `staged` label
+1. The action fetches the current PR state from the API (to get up-to-date labels)
+2. Verifies the PR currently has the `to-stage` label
+3. Merges the PR into the `staging` branch
+4. Adds the `staged` label to the PR
+5. If the merge fails (e.g., due to conflicts), the action posts a comment on the PR explaining the issue and doesn't add the `staged` label
+
+**Note:** The action fetches current PR labels from the API (not from the event payload) to handle labels added after the PR was opened, since `github.event.pull_request.labels` only contains labels from when the PR was first created.
 
 When a PR is reopened or synchronized:
-1. The action checks if the PR has the `staged` label
-2. Verifies if all PR commits are still in the `staging` branch
-3. Removes the `staged` label if commits are no longer staged
+1. The action fetches the current PR state from the API
+2. Checks if the PR currently has the `staged` label
+3. Verifies if all PR commits are still in the `staging` branch
+4. Removes the `staged` label if commits are no longer staged
 
 ### Manual Sync Detection
 

@@ -246,8 +246,7 @@ all_pr_commits_in_staging() {
 
 # Handle PR labeled event
 handle_pr_labeled() {
-    # Handle both pull_request and issues events
-    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
+    local pr_number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
     local label_added=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
     
     if [ "$pr_number" = "null" ] || [ -z "$pr_number" ]; then
@@ -356,8 +355,7 @@ handle_pr_labeled() {
 
 # Handle PR unlabeled event
 handle_pr_unlabeled() {
-    # Handle both pull_request and issues events
-    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
+    local pr_number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
     
     if [ "$label" = "$STAGED_LABEL" ]; then
@@ -475,34 +473,21 @@ main() {
             ;;
         "pull_request")
             local action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
+            log_info "Pull request event detected with action: $action"
             if [ "$ENABLE_PR_LABELING" = "true" ]; then
                 case "$action" in
                     "opened"|"reopened"|"synchronize")
                         handle_pr_reopened
                         ;;
-                esac
-            fi
-            ;;
-        "issues")
-            local action=$(jq -r '.action' "$GITHUB_EVENT_PATH")
-            log_info "Issues event detected with action: $action"
-            log_info "Event payload preview:"
-            jq '{action, issue: {number: .issue.number, pull_request: .issue.pull_request}, label: .label.name}' "$GITHUB_EVENT_PATH" || true
-            
-            if [ "$ENABLE_PR_LABELING" = "true" ]; then
-                # Check if this is actually a PR (not just an issue)
-                local is_pr=$(jq -r '.issue.pull_request' "$GITHUB_EVENT_PATH")
-                if [ "$is_pr" != "null" ] && [ -n "$is_pr" ]; then
-                    if [ "$action" = "labeled" ]; then
-                        log_info "Handling PR labeled event via issues webhook"
+                    "labeled")
+                        log_info "Handling PR labeled event"
                         handle_pr_labeled
-                    elif [ "$action" = "unlabeled" ]; then
-                        log_info "Handling PR unlabeled event via issues webhook"
+                        ;;
+                    "unlabeled")
+                        log_info "Handling PR unlabeled event"
                         handle_pr_unlabeled
-                    fi
-                else
-                    log_info "Event is for an issue, not a PR, skipping"
-                fi
+                        ;;
+                esac
             fi
             ;;
         "push")
