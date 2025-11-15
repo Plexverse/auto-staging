@@ -4,7 +4,7 @@
 
 A powerful GitHub Action for automatically managing staging branches with configurable sync, reset, and PR labeling functionality.
 
-![Example](https://i.ibb.co/Kj71LTMY/discordbanner.gif)
+<img src="https://i.ibb.co/Kj71LTMY/discordbanner.gif" width="4096" alt="Demo GIF">
 
 ## Features
 
