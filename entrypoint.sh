@@ -372,12 +372,18 @@ handle_pr_reopened() {
     
     log_info "PR #$pr_number updated, checking if commits are still staged..."
     
-    # Get current PR labels via API
+    # Get current PR details from API (labels may have changed)
     local pr_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
         "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
     
-    local has_staged_label=$(echo "$pr_response" | jq -r '.labels[]?.name' | grep -q "^$STAGED_LABEL$" && echo "true" || echo "false")
+    # Get current labels from API response (not from event payload)
+    local current_labels=$(echo "$pr_response" | jq -r '.labels[].name')
+    local has_staged_label=false
+    
+    if echo "$current_labels" | grep -q "^$STAGED_LABEL$"; then
+        has_staged_label=true
+    fi
     
     if [ "$has_staged_label" = "true" ]; then
         # Check if all commits are still in staging
