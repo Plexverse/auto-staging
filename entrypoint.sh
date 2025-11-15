@@ -246,10 +246,16 @@ all_pr_commits_in_staging() {
 
 # Handle PR labeled event
 handle_pr_labeled() {
-    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
+    local pr_number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
     
+    if [ "$pr_number" = "null" ] || [ -z "$pr_number" ]; then
+        log_error "Could not determine PR number from event"
+        return 1
+    fi
+    
     if [ "$label" != "$TO_STAGE_LABEL" ]; then
+        log_info "Label '$label' is not '$TO_STAGE_LABEL', skipping"
         return 0
     fi
     
@@ -326,7 +332,7 @@ handle_pr_labeled() {
 
 # Handle PR unlabeled event
 handle_pr_unlabeled() {
-    local pr_number=$(jq -r '.pull_request.number // .issue.number' "$GITHUB_EVENT_PATH")
+    local pr_number=$(jq -r '.pull_request.number' "$GITHUB_EVENT_PATH")
     local label=$(jq -r '.label.name' "$GITHUB_EVENT_PATH")
     
     if [ "$label" = "$STAGED_LABEL" ]; then
