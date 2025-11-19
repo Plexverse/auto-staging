@@ -328,6 +328,10 @@ handle_pr_labeled() {
         # Add staged label
         add_label "$pr_number" "$STAGED_LABEL"
         log_info "Added $STAGED_LABEL label to PR #$pr_number"
+        
+        # Remove to-stage label since staging is complete
+        remove_label "$pr_number" "$TO_STAGE_LABEL"
+        log_info "Removed $TO_STAGE_LABEL label from PR #$pr_number (staging complete)"
     else
         log_error "Failed to merge PR #$pr_number into $STAGING_BRANCH"
         git merge --abort 2>/dev/null || true
