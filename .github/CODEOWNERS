@@ -1,3 +1,5 @@
 # This file ensures Copilot code review is automatically requested
 # GitHub Copilot will be requested as a code owner reviewer
 * @github-copilot
+# Engineering team code owners
+* @Plexverse/engineering
