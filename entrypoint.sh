@@ -20,9 +20,158 @@ log_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
+# ---------------------------------------------------------------------------
+# Failure reporting
+#
+# Anything that goes wrong while staging a PR has to end up as a comment on
+# that PR, not just as red text in the job log. STAGE_PR_NUMBER is set as soon
+# as we know which PR we are staging so that the EXIT trap below can still
+# report a failure from a place we did not explicitly guard.
+# ---------------------------------------------------------------------------
+
+# Honours GITHUB_API_URL so the action also works on GitHub Enterprise.
+API_URL="${GITHUB_API_URL:-https://api.github.com}"
+
+STAGE_PR_NUMBER=""        # PR currently being staged, empty when not staging
+FAILURE_REPORTED="false"  # set once we have commented about a failure
+CURRENT_STEP="starting up"
+
+# Record what we are doing, so an unexpected failure can say where it happened.
+set_step() {
+    CURRENT_STEP="$1"
+}
+
+# Link back to the run that produced the failure.
+run_url() {
+    if [ -n "$GITHUB_SERVER_URL" ] && [ -n "$GITHUB_RUN_ID" ]; then
+        echo "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+    else
+        echo "https://github.com/$GITHUB_REPOSITORY/actions"
+    fi
+}
+
+# Render command output inside a collapsed block, or nothing when there is none.
+details_block() {
+    local summary="$1"
+    local content="$2"
+
+    if [ -z "$content" ]; then
+        return 0
+    fi
+
+    printf '<details><summary>%s</summary>\n\n```\n%s\n```\n\n</details>' \
+        "$summary" "$content"
+}
+
+# Post a failure comment on the PR being staged. Only the first failure of a
+# run is reported, so the trap does not double up on an already-reported error.
+report_staging_failure() {
+    local pr_number="$1"
+    local body="$2"
+
+    if [ -z "$pr_number" ]; then
+        log_warn "Failure is not associated with a PR, cannot post a comment"
+        return 0
+    fi
+
+    if [ "$FAILURE_REPORTED" = "true" ]; then
+        return 0
+    fi
+
+    FAILURE_REPORTED="true"
+
+    if post_pr_comment "$pr_number" "$body"; then
+        log_info "Posted failure comment to PR #$pr_number"
+    else
+        log_error "Could not post failure comment to PR #$pr_number"
+    fi
+}
+
+# Report a staging failure on the current PR. Always returns non-zero so the
+# caller can `return 1` straight after it and the job goes red.
+# Usage: stage_failed <what went wrong> <what to do about it> [command output]
+stage_failed() {
+    local reason="$1"
+    local remedy="$2"
+    local output="${3:-}"
+    local body
+
+    body="❌ **Failed to stage this PR**"$'\n\n'
+    body+="$reason"$'\n\n'
+    body+="$remedy"$'\n\n'
+
+    local details
+    details=$(details_block "git output" "$output")
+    if [ -n "$details" ]; then
+        body+="$details"$'\n\n'
+    fi
+
+    body+="[View the action run]($(run_url))"
+
+    report_staging_failure "$STAGE_PR_NUMBER" "$body"
+    return 1
+}
+
+# Post a comment on every PR that currently carries the staged label. Used for
+# failures that affect staging as a whole rather than one specific PR.
+comment_on_staged_prs() {
+    local body="$1"
+    local affected_prs
+    affected_prs=$(get_prs_with_staged_label)
+
+    if [ -z "$affected_prs" ]; then
+        log_warn "No staged PRs to notify about this failure"
+        return 0
+    fi
+
+    local pr_number
+    while IFS= read -r pr_number; do
+        if [ -n "$pr_number" ]; then
+            if post_pr_comment "$pr_number" "$body"; then
+                log_info "Posted failure comment to PR #$pr_number"
+            else
+                log_error "Could not post failure comment to PR #$pr_number"
+            fi
+        fi
+    done <<< "$affected_prs"
+}
+
+# Runs on every exit. Guarantees that an unexpected non-zero exit while staging
+# a PR still reaches the PR instead of dying quietly in the job log.
+on_exit() {
+    local status=$?
+    trap - EXIT
+
+    if [ "$status" -ne 0 ] && [ "$FAILURE_REPORTED" != "true" ] && [ -n "$STAGE_PR_NUMBER" ]; then
+        log_error "Unexpected failure (exit code $status) while $CURRENT_STEP"
+        stage_failed \
+            "The staging action exited unexpectedly (exit code \`$status\`) while $CURRENT_STEP, so \`$STAGING_BRANCH\` may not contain this PR." \
+            "Check the action run for details, then remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+            "" || true
+    fi
+
+    exit "$status"
+}
+
+trap on_exit EXIT
+
 # Check if a branch exists
 branch_exists() {
     git ls-remote --heads origin "$1" | grep -q "$1"
+}
+
+# Ensure the staging branch exists and matches the current remote tip. Safe to
+# call again on a retry, which is why it resets rather than assuming a fresh
+# checkout.
+prepare_staging_branch() {
+    if ! branch_exists "$STAGING_BRANCH"; then
+        git fetch origin "$MAIN_BRANCH" --quiet
+        git checkout -B "$STAGING_BRANCH" "origin/$MAIN_BRANCH" --quiet
+        git push origin "$STAGING_BRANCH" --quiet
+    else
+        git fetch origin "$STAGING_BRANCH" --quiet
+        git checkout -B "$STAGING_BRANCH" "origin/$STAGING_BRANCH" --quiet
+    fi
 }
 
 # Get all commits in main that are not in staging
@@ -72,37 +221,70 @@ sync_to_staging() {
     git checkout "$staging_branch" --quiet
     git reset --hard "origin/$staging_branch" --quiet
     
-    # Merge main into staging
-    local merge_output=$(git merge "origin/$main_branch" --no-edit 2>&1)
-    if [ $? -ne 0 ]; then
+    # Merge main into staging.
+    #
+    # NOTE: the declaration and the assignment are deliberately split. In
+    # `local x=$(cmd)` the exit status belongs to `local`, which is always 0,
+    # so `$?` never saw the failure and conflicts were treated as successes.
+    local merge_output=""
+    local merge_status=0
+    merge_output=$(git merge "origin/$main_branch" --no-edit 2>&1) || merge_status=$?
+
+    if [ "$merge_status" -ne 0 ]; then
         log_warn "Merge conflict detected when syncing $main_branch to $staging_branch"
         git merge --abort 2>/dev/null || true
         
-        # Find PRs that might be affected (PRs with staged label)
+        # Tell the PRs that are sitting in staging that the sync broke
         if [ "$ENABLE_PR_LABELING" = "true" ]; then
-            local affected_prs=$(get_prs_with_staged_label)
-            if [ -n "$affected_prs" ]; then
-                local comment="⚠️ **Auto-sync from \`$main_branch\` to \`$staging_branch\` failed**\n\n"
-                comment+="A merge conflict occurred while syncing commits from \`$main_branch\` to \`$staging_branch\`. "
-                comment+="This may affect staged PRs. The staging branch will need to be manually updated or reset.\n\n"
-                comment+="You may need to:\n"
-                comment+="1. Manually resolve conflicts in \`$staging_branch\`\n"
-                comment+="2. Or reset \`$staging_branch\` to \`$main_branch\` (this will remove all staged changes)"
-                
-                while IFS= read -r pr_number; do
-                    if [ -n "$pr_number" ]; then
-                        post_pr_comment "$pr_number" "$comment"
-                        log_info "Posted sync failure comment to PR #$pr_number"
-                    fi
-                done <<< "$affected_prs"
+            local comment
+            comment="⚠️ **Auto-sync from \`$main_branch\` to \`$staging_branch\` failed**"$'\n\n'
+            comment+="A merge conflict occurred while syncing commits from \`$main_branch\` to \`$staging_branch\`. This may affect staged PRs, and \`$staging_branch\` will need to be manually updated or reset."$'\n\n'
+            comment+="You may need to:"$'\n'
+            comment+="1. Manually resolve conflicts in \`$staging_branch\`"$'\n'
+            comment+="2. Or reset \`$staging_branch\` to \`$main_branch\` (this will remove all staged changes)"$'\n\n'
+
+            local details
+            details=$(details_block "git output" "$merge_output")
+            if [ -n "$details" ]; then
+                comment+="$details"$'\n\n'
             fi
+
+            comment+="[View the action run]($(run_url))"
+
+            comment_on_staged_prs "$comment"
         fi
         
         return 1
     fi
     
-    # Push changes
-    git push origin "$staging_branch" --quiet
+    # Push changes. A rejected push used to kill the script under `set -e`
+    # without a word to anyone, leaving staging silently behind main.
+    local push_output=""
+    local push_status=0
+    push_output=$(git push origin "$staging_branch" 2>&1) || push_status=$?
+
+    if [ "$push_status" -ne 0 ]; then
+        log_error "Failed to push $staging_branch after syncing $main_branch"
+
+        if [ "$ENABLE_PR_LABELING" = "true" ]; then
+            local comment
+            comment="⚠️ **Auto-sync from \`$main_branch\` to \`$staging_branch\` failed**"$'\n\n'
+            comment+="The merge succeeded but pushing \`$staging_branch\` was rejected, so \`$staging_branch\` is still behind \`$main_branch\`."$'\n\n'
+
+            local details
+            details=$(details_block "git output" "$push_output")
+            if [ -n "$details" ]; then
+                comment+="$details"$'\n\n'
+            fi
+
+            comment+="[View the action run]($(run_url))"
+
+            comment_on_staged_prs "$comment"
+        fi
+
+        return 1
+    fi
+
     log_info "Successfully synced commits from $main_branch to $staging_branch"
     
     # Update PR labels after sync
@@ -160,7 +342,7 @@ reset_staging() {
 get_prs_with_staged_label() {
     local response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")
+        "$API_URL/repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")
     
     echo "$response" | jq -r ".[] | select(.labels[]?.name == \"$STAGED_LABEL\") | .number" 2>/dev/null || echo ""
 }
@@ -174,41 +356,70 @@ commit_exists_in_branch() {
     git branch -r --contains "$commit_sha" | grep -q "origin/$branch" 2>/dev/null
 }
 
-# Add label to PR
+# Add label to PR. Label problems are warnings, not run-stopping failures.
 add_label() {
     local pr_number="$1"
     local label="$2"
-    
-    curl -s -X POST \
+    local http_code
+
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
-        -d "{\"labels\":[\"$label\"]}" > /dev/null
+        "$API_URL/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels" \
+        -d "{\"labels\":[\"$label\"]}") || http_code="000"
+
+    if [ "$http_code" != "200" ] && [ "$http_code" != "201" ]; then
+        log_warn "Could not add label '$label' to PR #$pr_number (HTTP $http_code)"
+    fi
+
+    return 0
 }
 
-# Remove label from PR
+# Remove label from PR. A 404 just means the label was not there.
 remove_label() {
     local pr_number="$1"
     local label="$2"
-    
-    curl -s -X DELETE \
+    local http_code
+
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X DELETE \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels/$label" > /dev/null
+        "$API_URL/repos/$GITHUB_REPOSITORY/issues/$pr_number/labels/$label") || http_code="000"
+
+    if [ "$http_code" != "200" ] && [ "$http_code" != "404" ]; then
+        log_warn "Could not remove label '$label' from PR #$pr_number (HTTP $http_code)"
+    fi
+
+    return 0
 }
 
-# Post comment to PR
+# Post comment to PR. Returns non-zero if GitHub did not accept the comment, so
+# a failure to report a failure is itself visible in the log.
 post_pr_comment() {
     local pr_number="$1"
     local comment="$2"
-    
-    local comment_json=$(jq -n --arg body "$comment" '{body: $body}')
-    
-    curl -s -X POST \
+
+    local comment_json
+    comment_json=$(jq -n --arg body "$comment" '{body: $body}')
+
+    local response_file
+    response_file=$(mktemp)
+
+    local http_code
+    http_code=$(curl -s -o "$response_file" -w "%{http_code}" -X POST \
         -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$pr_number/comments" \
-        -d "$comment_json" > /dev/null
+        "$API_URL/repos/$GITHUB_REPOSITORY/issues/$pr_number/comments" \
+        -d "$comment_json") || http_code="000"
+
+    if [ "$http_code" != "201" ]; then
+        log_error "GitHub rejected the comment on PR #$pr_number (HTTP $http_code): $(head -c 500 "$response_file")"
+        rm -f "$response_file"
+        return 1
+    fi
+
+    rm -f "$response_file"
+    return 0
 }
 
 # Get PR commits
@@ -217,7 +428,7 @@ get_pr_commits() {
     
     local response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$pr_number/commits")
+        "$API_URL/repos/$GITHUB_REPOSITORY/pulls/$pr_number/commits")
     
     echo "$response" | jq -r ".[].sha" 2>/dev/null || echo ""
 }
@@ -257,8 +468,20 @@ handle_pr_labeled() {
     # Get current PR details from API (labels may have changed since PR was opened)
     local pr_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
+        "$API_URL/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
     
+    # A failed API read used to leave base_branch as "null", which fell through
+    # to the "targets another branch, skipping" path and reported success.
+    if [ -z "$pr_response" ] || [ "$(echo "$pr_response" | jq -r '.number // "null"')" = "null" ]; then
+        log_error "Could not read PR #$pr_number from the GitHub API"
+        STAGE_PR_NUMBER="$pr_number"
+        stage_failed \
+            "Could not read this PR from the GitHub API, so it was not staged." \
+            "This is usually a transient API error. Remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+            "$(echo "$pr_response" | head -c 500)"
+        return 1
+    fi
+
     local base_branch=$(echo "$pr_response" | jq -r '.base.ref')
     local pr_state=$(echo "$pr_response" | jq -r '.state')
     
@@ -300,61 +523,130 @@ handle_pr_labeled() {
     
     if [ -z "$pr_head" ] || [ "$pr_head" = "null" ]; then
         log_error "Could not determine PR head branch"
+        STAGE_PR_NUMBER="$pr_number"
+        stage_failed \
+            "Could not determine the head branch of this PR, so it was not staged." \
+            "Remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+            ""
         return 1
     fi
+    
+    # From here on we know which PR we are staging. Every failure below - the
+    # ones handled explicitly and the ones we did not think of - now reaches
+    # the PR, via stage_failed or via the EXIT trap.
+    STAGE_PR_NUMBER="$pr_number"
     
     # Fetch PR branch
-    git fetch origin "$pr_head" --quiet
-    
-    # Ensure staging branch exists
-    if ! branch_exists "$STAGING_BRANCH"; then
-        git fetch origin "$MAIN_BRANCH" --quiet
-        git checkout -b "$STAGING_BRANCH" "origin/$MAIN_BRANCH"
-        git push origin "$STAGING_BRANCH" --quiet
-    else
-        git fetch origin "$STAGING_BRANCH" --quiet
-        git checkout "$STAGING_BRANCH" --quiet
-        git reset --hard "origin/$STAGING_BRANCH" --quiet
-    fi
-    
-    # Merge PR into staging
-    local merge_output=$(git merge "$pr_sha" --no-edit 2>&1)
-    local merge_status=$?
-    
-    if [ $merge_status -eq 0 ]; then
-        git push origin "$STAGING_BRANCH" --quiet
-        log_info "Successfully merged PR #$pr_number into $STAGING_BRANCH"
-        
-        # Add staged label
-        add_label "$pr_number" "$STAGED_LABEL"
-        log_info "Added $STAGED_LABEL label to PR #$pr_number"
-        
-        # Remove to-stage label since staging is complete
-        remove_label "$pr_number" "$TO_STAGE_LABEL"
-        log_info "Removed $TO_STAGE_LABEL label from PR #$pr_number (staging complete)"
-    else
-        log_error "Failed to merge PR #$pr_number into $STAGING_BRANCH"
-        git merge --abort 2>/dev/null || true
-        
-        # Post comment to PR about the failure
-        local comment="❌ **Failed to stage this PR**\n\n"
-        comment+="The merge into \`$STAGING_BRANCH\` failed. "
-        
-        if echo "$merge_output" | grep -qi "CONFLICT\|conflict"; then
-            comment+="**Merge conflict detected.**\n\n"
-            comment+="Please resolve the conflicts and try again. You may need to:\n"
-            comment+="1. Update your branch with the latest changes from \`$STAGING_BRANCH\`\n"
-            comment+="2. Resolve any conflicts\n"
-            comment+="3. Remove and re-add the \`$TO_STAGE_LABEL\` label to retry staging"
-        else
-            comment+="**Merge error occurred.**\n\n"
-            comment+="Please check your PR and try again. You can remove and re-add the \`$TO_STAGE_LABEL\` label to retry staging."
-        fi
-        
-        post_pr_comment "$pr_number" "$comment"
-        log_info "Posted failure comment to PR #$pr_number"
+    set_step "fetching the PR branch \`$pr_head\`"
+    local fetch_output=""
+    if ! fetch_output=$(git fetch origin "$pr_head" 2>&1); then
+        log_error "Could not fetch PR branch $pr_head"
+        stage_failed \
+            "Could not fetch the PR branch \`$pr_head\`, so \`$STAGING_BRANCH\` was not updated." \
+            "This usually means the branch was deleted, or it lives on a fork this action cannot read. Push the branch to this repository, then remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+            "$fetch_output"
         return 1
     fi
+    
+    # Merge into staging and push. A concurrent push to the staging branch
+    # rejects ours, so re-sync and retry a few times before giving up - that
+    # race used to drop the merge without telling anyone.
+    local max_attempts=3
+    local attempt=1
+    local merge_output=""
+    local merge_status=0
+    local push_output=""
+    local push_status=0
+    local prep_output=""
+    
+    while true; do
+        set_step "updating \`$STAGING_BRANCH\` (attempt $attempt of $max_attempts)"
+        
+        if ! prep_output=$(prepare_staging_branch 2>&1); then
+            log_error "Could not prepare $STAGING_BRANCH for the merge"
+            stage_failed \
+                "Could not prepare \`$STAGING_BRANCH\` for the merge, so it was not updated." \
+                "Check the action run, then remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+                "$prep_output"
+            return 1
+        fi
+        
+        # NOTE: the declaration and the assignment are deliberately split. In
+        # `local x=$(cmd)` the exit status belongs to `local`, which is always
+        # 0, so a conflicted merge used to take the success path - pushing
+        # nothing, logging "Successfully merged", and labelling the PR staged.
+        merge_status=0
+        merge_output=$(git merge "$pr_sha" --no-edit 2>&1) || merge_status=$?
+        
+        if [ "$merge_status" -ne 0 ]; then
+            log_error "Failed to merge PR #$pr_number into $STAGING_BRANCH"
+            git merge --abort 2>/dev/null || true
+            
+            if echo "$merge_output" | grep -qi "conflict"; then
+                stage_failed \
+                    "Merging this PR into \`$STAGING_BRANCH\` hit a **merge conflict**, so \`$STAGING_BRANCH\` was not updated." \
+                    "$(printf '%s\n%s\n%s\n%s' \
+                        "To retry:" \
+                        "1. Merge the latest \`$STAGING_BRANCH\` into your branch" \
+                        "2. Resolve the conflicts and push" \
+                        "3. Remove and re-add the \`$TO_STAGE_LABEL\` label")" \
+                    "$merge_output"
+            else
+                stage_failed \
+                    "Merging this PR into \`$STAGING_BRANCH\` failed, so \`$STAGING_BRANCH\` was not updated." \
+                    "Check the git output below, then remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+                    "$merge_output"
+            fi
+            return 1
+        fi
+        
+        push_status=0
+        push_output=$(git push origin "$STAGING_BRANCH" 2>&1) || push_status=$?
+        
+        if [ "$push_status" -eq 0 ]; then
+            break
+        fi
+        
+        log_warn "Push to $STAGING_BRANCH was rejected (attempt $attempt of $max_attempts)"
+        
+        if [ "$attempt" -ge "$max_attempts" ]; then
+            stage_failed \
+                "The merge succeeded but pushing \`$STAGING_BRANCH\` was rejected $max_attempts times, so this PR is **not** staged." \
+                "Something else is pushing to \`$STAGING_BRANCH\` at the same time. Remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+                "$push_output"
+            return 1
+        fi
+        
+        attempt=$((attempt + 1))
+        sleep $(( attempt * 5 ))
+    done
+    
+    # Do not trust the push on its own - confirm the PR head really is an
+    # ancestor of the remote staging branch before reporting success.
+    set_step "verifying \`$STAGING_BRANCH\` contains this PR"
+    git fetch origin "$STAGING_BRANCH" --quiet
+    
+    if ! git merge-base --is-ancestor "$pr_sha" "origin/$STAGING_BRANCH"; then
+        log_error "PR #$pr_number is not contained in origin/$STAGING_BRANCH after pushing"
+        stage_failed \
+            "\`$STAGING_BRANCH\` was pushed but does not contain \`$pr_sha\`, so this PR is **not** staged." \
+            "Something else moved \`$STAGING_BRANCH\` at the same time. Remove and re-add the \`$TO_STAGE_LABEL\` label to retry." \
+            ""
+        return 1
+    fi
+    
+    log_info "Successfully merged PR #$pr_number into $STAGING_BRANCH"
+    
+    # Add staged label
+    add_label "$pr_number" "$STAGED_LABEL"
+    log_info "Added $STAGED_LABEL label to PR #$pr_number"
+    
+    # Remove to-stage label since staging is complete
+    remove_label "$pr_number" "$TO_STAGE_LABEL"
+    log_info "Removed $TO_STAGE_LABEL label from PR #$pr_number (staging complete)"
+    
+    STAGE_PR_NUMBER=""
+    return 0
 }
 
 # Handle PR unlabeled event
@@ -377,7 +669,7 @@ handle_pr_reopened() {
     # Get current PR details from API (labels may have changed)
     local pr_response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
+        "$API_URL/repos/$GITHUB_REPOSITORY/pulls/$pr_number")
     
     # Get current labels from API response (not from event payload)
     local current_labels=$(echo "$pr_response" | jq -r '.labels[].name')
@@ -401,7 +693,7 @@ update_pr_labels_after_sync() {
     # Get all PRs and check their current labels from API
     local response=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
         -H "Accept: application/vnd.github.v3+json" \
-        "https://api.github.com/repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")
+        "$API_URL/repos/$GITHUB_REPOSITORY/pulls?state=all&per_page=100")
     
     echo "$response" | jq -r ".[] | select(.labels[]?.name == \"$STAGED_LABEL\") | .number" | while read -r pr_number; do
         if [ -n "$pr_number" ]; then

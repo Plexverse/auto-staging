@@ -13,6 +13,8 @@ A powerful GitHub Action for automatically managing staging branches with config
 - ✅ **PR labeling** - Automatically stage PRs when labeled with `to-stage`, and mark them as `staged` when complete
 - ✅ **Smart label management** - Removes `staged` labels when PRs are removed from staging or when commits are no longer staged
 - ✅ **Manual sync detection** - Detects when commits are manually added to staging and syncs if needed
+- ✅ **Reports failures on the PR** - Every failure to stage a PR is commented on that PR, with the git output and a link to the run
+- ✅ **Verified staging** - Confirms the staging branch really contains the PR before marking it `staged`, and retries a push lost to a concurrent update
 - ✅ **Fully configurable** - All branch names, labels, and behaviors are configurable
 
 ## Usage
@@ -103,9 +105,16 @@ On the configured schedule (default: Sunday midnight UTC), the action:
 When a PR is labeled with the `to-stage` label:
 1. The action fetches the current PR state from the API (to get up-to-date labels)
 2. Verifies the PR currently has the `to-stage` label
-3. Merges the PR into the `staging` branch
-4. Adds the `staged` label to the PR
-5. If the merge fails (e.g., due to conflicts), the action posts a comment on the PR explaining the issue and doesn't add the `staged` label
+3. Merges the PR into the `staging` branch and pushes it
+4. Re-fetches `staging` and verifies it actually contains the PR head commit
+5. Adds the `staged` label to the PR and removes the `to-stage` label
+6. If anything fails, the action posts a comment on the PR explaining what went wrong and does **not** add the `staged` label
+
+If the push is rejected because something else updated `staging` at the same
+time, the action re-syncs and retries (3 attempts) before giving up and
+commenting. The `staged` label is only applied once the PR head commit is
+confirmed to be an ancestor of the remote `staging` branch, so a green run
+always means the change really is staged.
 
 **Note:** The action fetches current PR labels from the API (not from the event payload) to handle labels added after the PR was opened, since `github.event.pull_request.labels` only contains labels from when the PR was first created.
 
@@ -204,6 +213,17 @@ If a merge conflict occurs when syncing or staging a PR, the action will:
 - Not push any changes
 - Post a comment on affected PRs explaining the conflict and how to resolve it
 - For PR staging, not add the `staged` label
+- Fail the job, so the run shows up red rather than silently passing
+
+### A PR was never staged and nothing was reported
+
+This was possible in versions before the failure-reporting fix: a conflicted
+merge was mistakenly read as a success, so the run went green, the PR was
+labelled `staged`, and no comment was posted even though `staging` had not
+moved. Re-run against the current `v2` tag, which fails the job and comments on
+the PR instead. If a comment still does not appear, check the run log for
+`GitHub rejected the comment` - that means the token is missing
+`issues: write` / `pull-requests: write`.
 
 ### PR labels not updating
 
